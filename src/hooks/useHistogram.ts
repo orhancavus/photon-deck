@@ -29,8 +29,8 @@ export function useHistogram(
 
     if (!sampleCanvasRef.current) {
       const c = document.createElement('canvas');
-      c.width = 96;
-      c.height = 54;
+      c.width = 64;
+      c.height = 36;
       sampleCanvasRef.current = c;
     }
 
@@ -85,7 +85,7 @@ export function useHistogram(
       } catch {
         // Ignore cross-origin or transient canvas read errors
       }
-    }, 150);
+    }, 300);
 
     return () => clearInterval(interval);
   }, [enabled, sourceCanvasRef]);

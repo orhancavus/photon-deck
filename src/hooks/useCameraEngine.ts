@@ -221,11 +221,13 @@ export function useCameraEngine(
                 audioMeterInterval = window.setInterval(() => {
                   analyser.getByteFrequencyData(buf);
                   const avg = buf.reduce((a, b) => a + b, 0) / buf.length;
-                  setState((prev) => ({
-                    ...prev,
-                    audioLevel: Math.min(100, Math.round((avg / 140) * 100)),
-                  }));
-                }, 100);
+                  const nextLevel = Math.min(100, Math.round((avg / 140) * 100));
+                  setState((prev) =>
+                    Math.abs(prev.audioLevel - nextLevel) >= 2
+                      ? { ...prev, audioLevel: nextLevel }
+                      : prev
+                  );
+                }, 150);
               }
             })
             .catch(() => {
@@ -233,15 +235,22 @@ export function useCameraEngine(
             });
         }
 
+        // Bypass Vite dev proxy buffering when running on port 5173 by connecting directly to the Express host server on 3001
+        const apiBase =
+          window.location.port === '5173'
+            ? `${window.location.protocol}//${window.location.hostname}:3001`
+            : '';
+
         const queryParams = `deviceId=${encodeURIComponent(
           settings.selectedVideoDeviceId
         )}&width=${preset.width}&height=${preset.height}&fps=${settings.fps}`;
-        const streamUrl = `/api/host-stream?${queryParams}`;
-        const frameUrl = `/api/host-frame?${queryParams}`;
+        const rawStreamUrl = `${apiBase}/api/host-stream?raw=1&${queryParams}`;
+        const frameUrl = `${apiBase}/api/host-frame?${queryParams}`;
 
         let isDecoding = false;
         let pendingBytes: Uint8Array | null = null;
         let lastStreamFrameAt = performance.now();
+        let lastPolledSeq = '';
 
         const decodeNextJpeg = async (jpegBytes: Uint8Array) => {
           if (cancelled) return;
@@ -276,36 +285,44 @@ export function useCameraEngine(
           }
         };
 
-        // Fallback frame poller in case any intermediate proxy buffers multipart streams
+        // High-rate fallback poller (only activates if binary stream is ever stalled for >350ms)
+        let pollInFlight = false;
         hostPollTimer = window.setInterval(async () => {
-          if (cancelled) return;
-          if (performance.now() - lastStreamFrameAt < 450) return;
+          if (cancelled || pollInFlight) return;
+          if (performance.now() - lastStreamFrameAt < 350) return;
+          pollInFlight = true;
           try {
             const res = await fetch(`${frameUrl}&_t=${Date.now()}`, {
               signal: hostAbortController.signal,
               cache: 'no-store',
             });
             if (res.status === 200) {
-              const ab = await res.arrayBuffer();
-              if (ab.byteLength > 0) {
-                decodeNextJpeg(new Uint8Array(ab));
+              const seq = res.headers.get('X-Frame-Seq') || '';
+              if (!seq || seq !== lastPolledSeq) {
+                lastPolledSeq = seq;
+                const ab = await res.arrayBuffer();
+                if (ab.byteLength > 0) {
+                  decodeNextJpeg(new Uint8Array(ab));
+                }
               }
             }
           } catch {
             // ignore abort or transient error
+          } finally {
+            pollInFlight = false;
           }
-        }, 120);
+        }, 33);
 
-        // Primary continuous low-latency MJPEG stream reader
+        // Primary continuous O(1) length-prefixed binary MJPEG stream reader (application/octet-stream)
         (async () => {
           while (!cancelled) {
             try {
-              const res = await fetch(streamUrl, {
+              const res = await fetch(rawStreamUrl, {
                 signal: hostAbortController.signal,
                 cache: 'no-store',
               });
               if (!res.ok || !res.body) {
-                await new Promise((r) => setTimeout(r, 500));
+                await new Promise((r) => setTimeout(r, 300));
                 continue;
               }
 
@@ -316,11 +333,16 @@ export function useCameraEngine(
                 const { done, value } = await reader.read();
                 if (done || !value) break;
 
-                const combined = new Uint8Array(accum.length + value.length);
-                combined.set(accum, 0);
-                combined.set(value, accum.length);
+                if (accum.length === 0) {
+                  accum = value;
+                } else {
+                  const combined = new Uint8Array(accum.length + value.length);
+                  combined.set(accum, 0);
+                  combined.set(value, accum.length);
+                  accum = combined;
+                }
 
-                const extracted = extractLatestJpegFromBuffer(combined);
+                const extracted = extractLatestLengthPrefixedFrame(accum);
                 accum = extracted.remaining;
 
                 if (extracted.frame) {
@@ -330,7 +352,7 @@ export function useCameraEngine(
               }
             } catch {
               if (cancelled) break;
-              await new Promise((r) => setTimeout(r, 400));
+              await new Promise((r) => setTimeout(r, 250));
             }
           }
         })();
@@ -437,8 +459,13 @@ export function useCameraEngine(
             audioMeterInterval = window.setInterval(() => {
               analyser.getByteFrequencyData(buf);
               const avg = buf.reduce((a, b) => a + b, 0) / buf.length;
-              setState((prev) => ({ ...prev, audioLevel: Math.min(100, Math.round((avg / 140) * 100)) }));
-            }, 100);
+              const nextLevel = Math.min(100, Math.round((avg / 140) * 100));
+              setState((prev) =>
+                Math.abs(prev.audioLevel - nextLevel) >= 2
+                  ? { ...prev, audioLevel: nextLevel }
+                  : prev
+              );
+            }, 150);
           }
         } else {
           setState((prev) => ({ ...prev, audioLevel: 0 }));
@@ -640,11 +667,12 @@ export function useCameraEngine(
 
       frameCount++;
       if (now - lastFpsCheck >= 1000) {
-        const currentFps = Math.min(settings.fps, Math.round((frameCount * 1000) / (now - lastFpsCheck)));
-        setState((prev) => ({
-          ...prev,
-          measuredFps: currentFps || settings.fps,
-        }));
+        const currentFps =
+          Math.min(settings.fps, Math.round((frameCount * 1000) / (now - lastFpsCheck))) ||
+          settings.fps;
+        setState((prev) =>
+          prev.measuredFps !== currentFps ? { ...prev, measuredFps: currentFps } : prev
+        );
         frameCount = 0;
         lastFpsCheck = now;
       }
@@ -1097,41 +1125,36 @@ function drawHostWarmupScene(ctx: CanvasRenderingContext2D, w: number, h: number
   ctx.restore();
 }
 
-// Extracts the most recent complete JPEG frame (0xFFD8 .. 0xFFD9) from a rolling byte buffer
-function extractLatestJpegFromBuffer(buf: Uint8Array): {
+// Extracts the most recent complete 4-byte length-prefixed JPEG frame in O(1) time without byte scanning
+function extractLatestLengthPrefixedFrame(buf: Uint8Array): {
   frame: Uint8Array | null;
   remaining: Uint8Array;
 } {
   let latestFrame: Uint8Array | null = null;
-  let cursor = 0;
+  let offset = 0;
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
 
-  while (cursor < buf.length - 1) {
-    let soi = -1;
-    for (let i = cursor; i < buf.length - 1; i++) {
-      if (buf[i] === 0xff && buf[i + 1] === 0xd8) {
-        soi = i;
-        break;
-      }
-    }
-    if (soi === -1) {
+  while (offset + 4 <= buf.byteLength) {
+    const frameLen = view.getUint32(offset, false);
+    if (frameLen <= 0 || frameLen > 15_000_000) {
+      // Invalid length header; reset buffer
       return { frame: latestFrame, remaining: new Uint8Array(0) };
     }
-
-    let eoi = -1;
-    for (let i = soi + 2; i < buf.length - 1; i++) {
-      if (buf[i] === 0xff && buf[i + 1] === 0xd9) {
-        eoi = i + 2;
-        break;
-      }
+    if (offset + 4 + frameLen > buf.byteLength) {
+      // Incomplete frame; keep from offset onward for the next network chunk
+      break;
     }
-    if (eoi === -1) {
-      return { frame: latestFrame, remaining: buf.slice(soi) };
-    }
-
-    latestFrame = buf.slice(soi, eoi);
-    cursor = eoi;
+    latestFrame = buf.subarray(offset + 4, offset + 4 + frameLen);
+    offset += 4 + frameLen;
   }
 
-  return { frame: latestFrame, remaining: new Uint8Array(0) };
+  const remaining =
+    offset === 0
+      ? buf
+      : offset < buf.byteLength
+      ? buf.slice(offset)
+      : new Uint8Array(0);
+
+  return { frame: latestFrame, remaining };
 }
 

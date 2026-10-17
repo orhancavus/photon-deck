@@ -39,12 +39,21 @@ app.get('/api/system-info', async (req, res) => {
   }
 });
 
+interface StreamClient {
+  res: express.Response;
+  raw: boolean;
+}
+
 // Managed Host Camera Stream State (prevents AVFoundation device lock contention across reconnects)
 let activeFfmpeg: ChildProcess | null = null;
 let activeStreamKey = '';
 let latestJpegFrame: Buffer | null = null;
+let latestFrameSeq = 0;
 let idleStopTimer: NodeJS.Timeout | null = null;
-const streamClients = new Set<express.Response>();
+const streamClients = new Set<StreamClient>();
+
+const SOI_MARKER = Buffer.from([0xff, 0xd8, 0xff]);
+const EOI_MARKER = Buffer.from([0xff, 0xd9]);
 
 function stopActiveFfmpeg() {
   if (idleStopTimer) {
@@ -62,27 +71,37 @@ function stopActiveFfmpeg() {
   activeStreamKey = '';
 }
 
+function sendFrameToClient(client: StreamClient, jpegBuf: Buffer) {
+  const { res, raw } = client;
+  if (res.writableEnded || res.destroyed) {
+    streamClients.delete(client);
+    return;
+  }
+  try {
+    if (raw) {
+      const lenBuf = Buffer.allocUnsafe(4);
+      lenBuf.writeUInt32BE(jpegBuf.length, 0);
+      res.write(Buffer.concat([lenBuf, jpegBuf]));
+    } else {
+      const header = Buffer.from(
+        `--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpegBuf.length}\r\n\r\n`,
+        'ascii'
+      );
+      const footer = Buffer.from('\r\n', 'ascii');
+      res.write(Buffer.concat([header, jpegBuf, footer]));
+    }
+  } catch {
+    streamClients.delete(client);
+  }
+}
+
 function broadcastJpegFrame(jpegBuf: Buffer) {
   latestJpegFrame = jpegBuf;
+  latestFrameSeq++;
   if (streamClients.size === 0) return;
 
-  const header = Buffer.from(
-    `--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpegBuf.length}\r\n\r\n`,
-    'ascii'
-  );
-  const footer = Buffer.from('\r\n', 'ascii');
-  const packet = Buffer.concat([header, jpegBuf, footer]);
-
   for (const client of streamClients) {
-    if (client.writableEnded || client.destroyed) {
-      streamClients.delete(client);
-      continue;
-    }
-    try {
-      client.write(packet);
-    } catch {
-      streamClients.delete(client);
-    }
+    sendFrameToClient(client, jpegBuf);
   }
 }
 
@@ -95,13 +114,25 @@ function buildFfmpegArgs(
   use720pFallback = false
 ): string[] {
   if (driver === 'avfoundation') {
-    // macOS AVFoundation cameras strictly require 30fps at hardware input and standard 1280x720 or 1920x1080 capture size
-    const hwWidth = use720pFallback || width < 1920 ? 1280 : 1920;
-    const hwHeight = use720pFallback || height < 1080 ? 720 : 1080;
+    // Capture at 1280x720 (universally supported by all Mac FaceTime HD cameras) or 1920x1080 when >=1080p requested,
+    // then fast-scale to target dimensions (e.g. 640x480) before JPEG encoding.
+    const hwWidth = use720pFallback || width <= 1280 ? 1280 : 1920;
+    const hwHeight = use720pFallback || height <= 720 ? 720 : 1080;
+    const outW = Math.min(width, hwWidth);
+    const outH = Math.min(height, hwHeight);
+    const scaleArgs =
+      outW !== hwWidth || outH !== hwHeight
+        ? ['-vf', `scale=${outW}:${outH}:flags=fast_bilinear`]
+        : [];
+
     return [
       '-hide_banner',
       '-loglevel',
       'error',
+      '-probesize',
+      '32',
+      '-analyzeduration',
+      '0',
       '-fflags',
       'nobuffer',
       '-flags',
@@ -116,14 +147,21 @@ function buildFfmpegArgs(
       `${hwWidth}x${hwHeight}`,
       '-i',
       inputArg,
+      ...scaleArgs,
       '-fps_mode',
       'passthrough',
+      '-threads',
+      '2',
+      '-thread_type',
+      'slice',
       '-f',
       'image2pipe',
       '-vcodec',
       'mjpeg',
+      '-huffman',
+      'default',
       '-q:v',
-      '5',
+      '6',
       '-flush_packets',
       '1',
       'pipe:1',
@@ -133,6 +171,10 @@ function buildFfmpegArgs(
       '-hide_banner',
       '-loglevel',
       'error',
+      '-probesize',
+      '32',
+      '-analyzeduration',
+      '0',
       '-fflags',
       'nobuffer',
       '-flags',
@@ -147,12 +189,18 @@ function buildFfmpegArgs(
       inputArg,
       '-fps_mode',
       'passthrough',
+      '-threads',
+      '2',
+      '-thread_type',
+      'slice',
       '-f',
       'image2pipe',
       '-vcodec',
       'mjpeg',
+      '-huffman',
+      'default',
       '-q:v',
-      '5',
+      '6',
       '-flush_packets',
       '1',
       'pipe:1',
@@ -162,6 +210,10 @@ function buildFfmpegArgs(
       '-hide_banner',
       '-loglevel',
       'error',
+      '-probesize',
+      '32',
+      '-analyzeduration',
+      '0',
       '-fflags',
       'nobuffer',
       '-flags',
@@ -176,12 +228,18 @@ function buildFfmpegArgs(
       inputArg,
       '-fps_mode',
       'passthrough',
+      '-threads',
+      '2',
+      '-thread_type',
+      'slice',
       '-f',
       'image2pipe',
       '-vcodec',
       'mjpeg',
+      '-huffman',
+      'default',
       '-q:v',
-      '5',
+      '6',
       '-flush_packets',
       '1',
       'pipe:1',
@@ -215,42 +273,36 @@ function ensureFfmpegStream(
   activeFfmpeg = ff;
 
   let accum = Buffer.alloc(0);
+  let searchOffset = 0;
   let producedFrames = 0;
 
   ff.stdout?.on('data', (chunk: Buffer) => {
-    accum = Buffer.concat([accum, chunk]);
+    accum = accum.length === 0 ? chunk : Buffer.concat([accum, chunk]);
 
-    // Extract all complete JPEG frames (SOI 0xFFD8 to EOI 0xFFD9)
     while (true) {
-      let soi = -1;
-      for (let i = 0; i < accum.length - 1; i++) {
-        if (accum[i] === 0xff && accum[i + 1] === 0xd8) {
-          soi = i;
-          break;
-        }
-      }
+      const soi = accum.indexOf(SOI_MARKER);
       if (soi === -1) {
         accum = Buffer.alloc(0);
+        searchOffset = 0;
         break;
       }
       if (soi > 0) {
         accum = accum.subarray(soi);
+        searchOffset = Math.max(2, searchOffset - soi);
+      } else if (searchOffset < 2) {
+        searchOffset = 2;
       }
 
-      let eoi = -1;
-      for (let i = 2; i < accum.length - 1; i++) {
-        if (accum[i] === 0xff && accum[i + 1] === 0xd9) {
-          eoi = i + 2;
-          break;
-        }
-      }
-
-      if (eoi === -1) {
+      const eoiPos = accum.indexOf(EOI_MARKER, searchOffset);
+      if (eoiPos === -1) {
+        searchOffset = Math.max(2, accum.length - 1);
         break;
       }
 
-      const frame = Buffer.from(accum.subarray(0, eoi));
-      accum = accum.subarray(eoi);
+      const frameEnd = eoiPos + 2;
+      const frame = Buffer.from(accum.subarray(0, frameEnd));
+      accum = accum.subarray(frameEnd);
+      searchOffset = 2;
       producedFrames++;
       broadcastJpegFrame(frame);
     }
@@ -265,16 +317,15 @@ function ensureFfmpegStream(
         code !== 0 &&
         producedFrames === 0 &&
         driver === 'avfoundation' &&
-        !use720pFallback &&
-        streamClients.size > 0
+        !use720pFallback
       ) {
-        ensureFfmpegStream(driver, inputArg, 1280, 720, fps, true);
+        ensureFfmpegStream(driver, inputArg, width, height, fps, true);
       }
     }
   });
 }
 
-// 2. Host MJPEG Live Stream Endpoint (for Headless Raspberry Pi, macOS, Windows host streaming)
+// 2. Host MJPEG Live Stream Endpoint (supports ?raw=1 length-prefixed binary frames + multipart MJPEG)
 app.get('/api/host-stream', async (req, res) => {
   const info = await getPlatformInfo();
   const cameras = await listHostCameras();
@@ -282,6 +333,7 @@ app.get('/api/host-stream', async (req, res) => {
   const width = Number(req.query.width) || 1280;
   const height = Number(req.query.height) || 720;
   const fps = Number(req.query.fps) || 30;
+  const raw = req.query.raw === '1';
 
   const selectedCam = cameras.find((c) => c.id === deviceId) || cameras[0];
 
@@ -296,7 +348,9 @@ app.get('/api/host-stream', async (req, res) => {
   res.socket?.setNoDelay(true);
 
   res.writeHead(200, {
-    'Content-Type': 'multipart/x-mixed-replace; boundary=ffserver',
+    'Content-Type': raw
+      ? 'application/octet-stream'
+      : 'multipart/x-mixed-replace; boundary=ffserver',
     'Cache-Control': 'no-cache, no-store, must-revalidate',
     Connection: 'keep-alive',
     Pragma: 'no-cache',
@@ -304,33 +358,28 @@ app.get('/api/host-stream', async (req, res) => {
   });
   res.flushHeaders?.();
 
-  streamClients.add(res);
+  const client: StreamClient = { res, raw };
+  streamClients.add(client);
   ensureFfmpegStream(selectedCam.driver, selectedCam.inputArg, width, height, fps);
 
-  // Immediately push the latest cached frame if available so the viewfinder renders with zero cold-start delay
   if (latestJpegFrame) {
-    const header = Buffer.from(
-      `--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${latestJpegFrame.length}\r\n\r\n`,
-      'ascii'
-    );
-    const footer = Buffer.from('\r\n', 'ascii');
-    res.write(Buffer.concat([header, latestJpegFrame, footer]));
+    sendFrameToClient(client, latestJpegFrame);
   }
 
   req.on('close', () => {
-    streamClients.delete(res);
+    streamClients.delete(client);
     if (streamClients.size === 0) {
       if (idleStopTimer) clearTimeout(idleStopTimer);
       idleStopTimer = setTimeout(() => {
         if (streamClients.size === 0) {
           stopActiveFfmpeg();
         }
-      }, 1500);
+      }, 2500);
     }
   });
 });
 
-// Single-frame low-latency snapshot endpoint for host stream fallback
+// Single-frame low-latency snapshot endpoint
 app.get('/api/host-frame', async (req, res) => {
   const info = await getPlatformInfo();
   const cameras = await listHostCameras();
@@ -345,6 +394,15 @@ app.get('/api/host-frame', async (req, res) => {
     return;
   }
 
+  if (idleStopTimer) {
+    clearTimeout(idleStopTimer);
+    idleStopTimer = setTimeout(() => {
+      if (streamClients.size === 0) {
+        stopActiveFfmpeg();
+      }
+    }, 2500);
+  }
+
   ensureFfmpegStream(selectedCam.driver, selectedCam.inputArg, width, height, fps);
 
   if (latestJpegFrame) {
@@ -352,6 +410,7 @@ app.get('/api/host-frame', async (req, res) => {
       'Content-Type': 'image/jpeg',
       'Cache-Control': 'no-cache, no-store, must-revalidate',
       'Content-Length': String(latestJpegFrame.length),
+      'X-Frame-Seq': String(latestFrameSeq),
     });
     res.end(latestJpegFrame);
   } else {
