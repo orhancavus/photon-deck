@@ -24,6 +24,7 @@ export interface PlatformInfo {
 
 let cachedPlatformInfo: PlatformInfo | null = null;
 let cachedHostCameras: HostCameraDevice[] | null = null;
+let cachedHostCamerasAt = 0;
 
 export async function getPlatformInfo(forceRefresh = false): Promise<PlatformInfo> {
   if (cachedPlatformInfo && !forceRefresh) {
@@ -110,7 +111,8 @@ export async function getPlatformInfo(forceRefresh = false): Promise<PlatformInf
 }
 
 export async function listHostCameras(forceRefresh = false): Promise<HostCameraDevice[]> {
-  if (cachedHostCameras && !forceRefresh) {
+  const now = Date.now();
+  if (cachedHostCameras && !forceRefresh && now - cachedHostCamerasAt < 1500) {
     return cachedHostCameras;
   }
 
@@ -126,13 +128,35 @@ export async function listHostCameras(forceRefresh = false): Promise<HostCameraD
         inputArg: '0',
       },
     ];
+    cachedHostCamerasAt = Date.now();
     return cachedHostCameras;
   }
 
   try {
     if (info.platform === 'macos') {
-      const { stderr } = await execAsync('ffmpeg -f avfoundation -list_devices true -i "" || true');
-      const lines = stderr.split('\n');
+      // 1. Query system_profiler SPCameraDataType first: this wakes up CoreMediaIO Continuity Camera DAL
+      // and discovers iPhone Continuity Cameras on the same Apple ID & network even when FFmpeg's
+      // deprecated [AVCaptureDevice devicesWithMediaType:] API omits them.
+      let profilerNames: string[] = [];
+      try {
+        const { stdout } = await execAsync('system_profiler SPCameraDataType -json 2>/dev/null || true');
+        if (stdout && stdout.trim().startsWith('{')) {
+          const parsed = JSON.parse(stdout);
+          const items = Array.isArray(parsed?.SPCameraDataType) ? parsed.SPCameraDataType : [];
+          for (const item of items) {
+            const rawName = typeof item?._name === 'string' ? item._name.trim() : '';
+            if (rawName && !rawName.toLowerCase().includes('capture screen')) {
+              profilerNames.push(rawName);
+            }
+          }
+        }
+      } catch {
+        // ignore system_profiler parse errors
+      }
+
+      // 2. Query FFmpeg AVFoundation device list
+      const { stderr } = await execAsync('ffmpeg -f avfoundation -list_devices true -i "" 2>&1 || true');
+      const lines = (stderr || '').split('\n');
       let inVideoSection = false;
       for (const line of lines) {
         if (line.includes('AVFoundation video devices:')) {
@@ -156,6 +180,21 @@ export async function listHostCameras(forceRefresh = false): Promise<HostCameraD
               });
             }
           }
+        }
+      }
+
+      // 3. Ensure any Continuity Camera / iPhone Camera found by macOS system_profiler is also listed
+      for (const camName of profilerNames) {
+        const norm = camName.toLowerCase();
+        const alreadyListed = devices.some((d) => d.label.toLowerCase().includes(norm));
+        if (!alreadyListed) {
+          const slug = norm.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+          devices.push({
+            id: `avfoundation-name-${slug}`,
+            label: `${camName} (Host AVFoundation)`,
+            driver: 'avfoundation',
+            inputArg: `${camName}:none`,
+          });
         }
       }
     } else if (info.platform === 'linux' || info.platform === 'raspberrypi') {
@@ -199,5 +238,6 @@ export async function listHostCameras(forceRefresh = false): Promise<HostCameraD
   }
 
   cachedHostCameras = devices;
+  cachedHostCamerasAt = Date.now();
   return devices;
 }

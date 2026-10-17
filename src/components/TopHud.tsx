@@ -186,7 +186,7 @@ export const TopHud: React.FC<TopHudProps> = ({
             ))}
           </select>
           <button
-            onClick={onRefreshDevices}
+            onClick={() => onRefreshDevices()}
             className="p-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-400 hover:text-zinc-100 hover:border-zinc-700 transition-colors"
             title="Rescan Camera Hardware"
           >
