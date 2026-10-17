@@ -89,7 +89,7 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
       const url = URL.createObjectURL(zipBlob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `CamStudio_Export_${new Date().toISOString().slice(0, 10)}.zip`;
+      a.download = `PhotonDeck_Export_${new Date().toISOString().slice(0, 10)}.zip`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);

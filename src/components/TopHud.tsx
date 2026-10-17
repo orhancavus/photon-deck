@@ -75,7 +75,27 @@ export const TopHud: React.FC<TopHudProps> = ({
   };
 
   const handleEngineSwitch = (mode: EngineMode) => {
-    updateSettings({ engineMode: mode });
+    if (mode === 'host') {
+      const currentDev = videoDevices.find((d) => d.id === settings.selectedVideoDeviceId);
+      const firstHost = videoDevices.find((d) => d.source === 'host');
+      updateSettings({
+        engineMode: 'host',
+        selectedVideoDeviceId:
+          currentDev?.source === 'host'
+            ? currentDev.id
+            : firstHost?.id || settings.selectedVideoDeviceId,
+      });
+    } else if (mode === 'webrtc') {
+      const currentDev = videoDevices.find((d) => d.id === settings.selectedVideoDeviceId);
+      const firstWebrtc = videoDevices.find((d) => d.source === 'webrtc');
+      updateSettings({
+        engineMode: 'webrtc',
+        selectedVideoDeviceId:
+          currentDev?.source === 'webrtc' ? currentDev.id : firstWebrtc?.id || 'default',
+      });
+    } else {
+      updateSettings({ engineMode: mode });
+    }
   };
 
   const platformBadge = systemInfo?.platformLabel || 'Multi-Platform Studio';
@@ -90,7 +110,7 @@ export const TopHud: React.FC<TopHudProps> = ({
           </div>
           <div className="hidden sm:block">
             <div className="flex items-center gap-1.5">
-              <span className="font-bold tracking-tight text-sm text-zinc-100">CAMSTUDIO</span>
+              <span className="font-bold tracking-tight text-sm text-zinc-100">PHOTONDECK</span>
               <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 border border-amber-500/30 font-semibold">
                 PRO
               </span>

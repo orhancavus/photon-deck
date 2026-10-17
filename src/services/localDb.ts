@@ -1,6 +1,6 @@
 import { MediaItem } from '../types/camera';
 
-const DB_NAME = 'CamStudioProDB';
+const DB_NAME = 'PhotonDeckDB';
 const DB_VERSION = 1;
 const STORE_NAME = 'media_items';
 

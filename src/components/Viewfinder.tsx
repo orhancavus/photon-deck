@@ -31,27 +31,16 @@ export const Viewfinder: React.FC<ViewfinderProps> = ({
   timelapseProgress,
   errorMsg,
 }) => {
-  const preset = RESOLUTION_PRESETS[settings.resolution];
-  const hostStreamUrl = `/api/host-stream?deviceId=${encodeURIComponent(
-    settings.selectedVideoDeviceId
-  )}&width=${preset.width}&height=${preset.height}&fps=${settings.fps}`;
-
   return (
     <div className="relative flex-1 bg-zinc-950 flex items-center justify-center overflow-hidden select-none p-3 sm:p-6">
-      {/* Hidden raw media elements feeding the real-time compositor canvas */}
-      <video ref={videoRef} playsInline muted className="hidden" />
-      {settings.engineMode === 'host' && (
-        <img
-          ref={hostImgRef}
-          src={hostStreamUrl}
-          crossOrigin="anonymous"
-          alt="Host Stream"
-          className="hidden"
-          onError={() => {
-            updateSettings({ engineMode: 'test-pattern' });
-          }}
-        />
-      )}
+      {/* Offscreen raw video element feeding the real-time compositor canvas in WebRTC mode */}
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted
+        className="fixed -top-[9999px] -left-[9999px] w-px h-px opacity-0 pointer-events-none"
+      />
 
       {/* Main Viewfinder Frame */}
       <div className="relative max-w-full max-h-full flex items-center justify-center rounded-xl overflow-hidden shadow-2xl border border-zinc-800/90 bg-black">

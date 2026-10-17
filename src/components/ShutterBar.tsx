@@ -85,23 +85,49 @@ export const ShutterBar: React.FC<ShutterBarProps> = ({
         {/* Primary Shutter / Record Button */}
         <button
           onClick={onTriggerPrimary}
-          className="group relative w-16 h-16 rounded-full p-1 border-2 border-zinc-300 hover:border-amber-400 transition-all flex items-center justify-center active:scale-95 shadow-xl"
+          className="group relative flex items-center gap-3 px-4 py-2 rounded-full bg-zinc-900/90 hover:bg-zinc-800 border-2 border-zinc-300 hover:border-amber-400 transition-all active:scale-95 shadow-xl cursor-pointer"
           title="Trigger Shutter / Record (Spacebar)"
         >
           {settings.captureMode === 'video' ? (
             isRecording ? (
-              <div className="w-7 h-7 rounded-md bg-red-500 flex items-center justify-center transition-all">
-                <Square className="w-4 h-4 text-white fill-white" />
-              </div>
+              <>
+                <div className="w-8 h-8 rounded-md bg-red-500 flex items-center justify-center transition-all">
+                  <Square className="w-4 h-4 text-white fill-white" />
+                </div>
+                <span className="text-xs font-bold uppercase tracking-wider text-red-400 pr-1">
+                  Stop Recording
+                </span>
+              </>
             ) : (
-              <div className="w-12 h-12 rounded-full bg-red-500 group-hover:bg-red-400 transition-all shadow-inner" />
+              <>
+                <div className="w-9 h-9 rounded-full bg-red-500 group-hover:bg-red-400 transition-all shadow-inner" />
+                <span className="text-xs font-bold uppercase tracking-wider text-zinc-100 group-hover:text-red-300 pr-1">
+                  Start Video
+                </span>
+              </>
             )
           ) : burstActive || timelapseActive ? (
-            <div className="w-8 h-8 rounded-md bg-amber-500 flex items-center justify-center">
-              <Square className="w-4 h-4 text-zinc-950 fill-zinc-950" />
-            </div>
+            <>
+              <div className="w-8 h-8 rounded-md bg-amber-500 flex items-center justify-center">
+                <Square className="w-4 h-4 text-zinc-950 fill-zinc-950" />
+              </div>
+              <span className="text-xs font-bold uppercase tracking-wider text-amber-300 pr-1">
+                Stop Sequence
+              </span>
+            </>
           ) : (
-            <div className="w-12 h-12 rounded-full bg-zinc-100 group-hover:bg-amber-400 transition-colors shadow-inner" />
+            <>
+              <div className="w-9 h-9 rounded-full bg-zinc-100 group-hover:bg-amber-400 transition-colors shadow-inner flex items-center justify-center">
+                <Camera className="w-4 h-4 text-zinc-950" />
+              </div>
+              <span className="text-xs font-bold uppercase tracking-wider text-zinc-100 group-hover:text-amber-300 pr-1">
+                {settings.captureMode === 'burst'
+                  ? 'Take Burst'
+                  : settings.captureMode === 'timelapse'
+                  ? 'Start Time-Lapse'
+                  : 'Take Picture'}
+              </span>
+            </>
           )}
         </button>
 

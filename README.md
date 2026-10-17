@@ -1,4 +1,4 @@
-# CamStudio Pro (`wonderful-planck`)
+# PhotonDeck
 
 A modern, multi-platform Camera Studio Web Application built for **macOS**, **Raspberry Pi**, **Linux**, and **Windows**. It features a hardware-inspired dark-room UI, multi-engine live video streaming, professional viewfinder tools, real-time RGB histogram analysis, and dual-storage media management.
 
@@ -56,7 +56,7 @@ A modern, multi-platform Camera Studio Web Application built for **macOS**, **Ra
 ## 📂 Project Structure
 
 ```text
-wonderful-planck/
+photon-deck/
 ├── index.html                   # Main HTML entry point
 ├── package.json                 # Dependencies and scripts
 ├── tsconfig.json                # TypeScript configuration

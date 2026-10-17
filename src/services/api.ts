@@ -5,9 +5,9 @@ import {
   deleteLocalMediaItem,
 } from './localDb';
 
-export async function fetchSystemInfo(): Promise<SystemInfoResponse> {
+export async function fetchSystemInfo(forceRefresh = false): Promise<SystemInfoResponse> {
   try {
-    const res = await fetch('/api/system-info');
+    const res = await fetch(forceRefresh ? '/api/system-info?refresh=1' : '/api/system-info');
     if (!res.ok) throw new Error('Backend unreachable');
     return await res.json();
   } catch {

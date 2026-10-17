@@ -21,11 +21,14 @@ app.use(express.json({ limit: '250mb' }));
 ensureMediaDir();
 app.use('/media-files', express.static(getMediaDir()));
 
+import { ChildProcess } from 'child_process';
+
 // 1. System & Platform Info
-app.get('/api/system-info', async (_req, res) => {
+app.get('/api/system-info', async (req, res) => {
   try {
-    const info = await getPlatformInfo();
-    const hostCameras = await listHostCameras();
+    const forceRefresh = req.query.refresh === '1';
+    const info = await getPlatformInfo(forceRefresh);
+    const hostCameras = await listHostCameras(forceRefresh);
     res.json({
       ...info,
       hostCameras,
@@ -35,6 +38,241 @@ app.get('/api/system-info', async (_req, res) => {
     res.status(500).json({ error: String(err) });
   }
 });
+
+// Managed Host Camera Stream State (prevents AVFoundation device lock contention across reconnects)
+let activeFfmpeg: ChildProcess | null = null;
+let activeStreamKey = '';
+let latestJpegFrame: Buffer | null = null;
+let idleStopTimer: NodeJS.Timeout | null = null;
+const streamClients = new Set<express.Response>();
+
+function stopActiveFfmpeg() {
+  if (idleStopTimer) {
+    clearTimeout(idleStopTimer);
+    idleStopTimer = null;
+  }
+  if (activeFfmpeg) {
+    try {
+      activeFfmpeg.kill('SIGTERM');
+    } catch {
+      // ignore
+    }
+    activeFfmpeg = null;
+  }
+  activeStreamKey = '';
+}
+
+function broadcastJpegFrame(jpegBuf: Buffer) {
+  latestJpegFrame = jpegBuf;
+  if (streamClients.size === 0) return;
+
+  const header = Buffer.from(
+    `--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpegBuf.length}\r\n\r\n`,
+    'ascii'
+  );
+  const footer = Buffer.from('\r\n', 'ascii');
+  const packet = Buffer.concat([header, jpegBuf, footer]);
+
+  for (const client of streamClients) {
+    if (client.writableEnded || client.destroyed) {
+      streamClients.delete(client);
+      continue;
+    }
+    try {
+      client.write(packet);
+    } catch {
+      streamClients.delete(client);
+    }
+  }
+}
+
+function buildFfmpegArgs(
+  driver: string,
+  inputArg: string,
+  width: number,
+  height: number,
+  fps: number,
+  use720pFallback = false
+): string[] {
+  if (driver === 'avfoundation') {
+    // macOS AVFoundation cameras strictly require 30fps at hardware input and standard 1280x720 or 1920x1080 capture size
+    const hwWidth = use720pFallback || width < 1920 ? 1280 : 1920;
+    const hwHeight = use720pFallback || height < 1080 ? 720 : 1080;
+    return [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-fflags',
+      'nobuffer',
+      '-flags',
+      'low_delay',
+      '-f',
+      'avfoundation',
+      '-pixel_format',
+      'uyvy422',
+      '-framerate',
+      '30',
+      '-video_size',
+      `${hwWidth}x${hwHeight}`,
+      '-i',
+      inputArg,
+      '-fps_mode',
+      'passthrough',
+      '-f',
+      'image2pipe',
+      '-vcodec',
+      'mjpeg',
+      '-q:v',
+      '5',
+      '-flush_packets',
+      '1',
+      'pipe:1',
+    ];
+  } else if (driver === 'v4l2' || driver === 'libcamera') {
+    return [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-fflags',
+      'nobuffer',
+      '-flags',
+      'low_delay',
+      '-f',
+      'v4l2',
+      '-framerate',
+      String(fps),
+      '-video_size',
+      `${width}x${height}`,
+      '-i',
+      inputArg,
+      '-fps_mode',
+      'passthrough',
+      '-f',
+      'image2pipe',
+      '-vcodec',
+      'mjpeg',
+      '-q:v',
+      '5',
+      '-flush_packets',
+      '1',
+      'pipe:1',
+    ];
+  } else {
+    return [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-fflags',
+      'nobuffer',
+      '-flags',
+      'low_delay',
+      '-f',
+      'dshow',
+      '-framerate',
+      String(fps),
+      '-video_size',
+      `${width}x${height}`,
+      '-i',
+      inputArg,
+      '-fps_mode',
+      'passthrough',
+      '-f',
+      'image2pipe',
+      '-vcodec',
+      'mjpeg',
+      '-q:v',
+      '5',
+      '-flush_packets',
+      '1',
+      'pipe:1',
+    ];
+  }
+}
+
+function ensureFfmpegStream(
+  driver: string,
+  inputArg: string,
+  width: number,
+  height: number,
+  fps: number,
+  use720pFallback = false
+) {
+  if (idleStopTimer) {
+    clearTimeout(idleStopTimer);
+    idleStopTimer = null;
+  }
+
+  const desiredKey = `${driver}:${inputArg}:${width}x${height}@${fps}:${use720pFallback}`;
+  if (activeFfmpeg && activeStreamKey === desiredKey) {
+    return;
+  }
+
+  stopActiveFfmpeg();
+  activeStreamKey = desiredKey;
+
+  const args = buildFfmpegArgs(driver, inputArg, width, height, fps, use720pFallback);
+  const ff = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  activeFfmpeg = ff;
+
+  let accum = Buffer.alloc(0);
+  let producedFrames = 0;
+
+  ff.stdout?.on('data', (chunk: Buffer) => {
+    accum = Buffer.concat([accum, chunk]);
+
+    // Extract all complete JPEG frames (SOI 0xFFD8 to EOI 0xFFD9)
+    while (true) {
+      let soi = -1;
+      for (let i = 0; i < accum.length - 1; i++) {
+        if (accum[i] === 0xff && accum[i + 1] === 0xd8) {
+          soi = i;
+          break;
+        }
+      }
+      if (soi === -1) {
+        accum = Buffer.alloc(0);
+        break;
+      }
+      if (soi > 0) {
+        accum = accum.subarray(soi);
+      }
+
+      let eoi = -1;
+      for (let i = 2; i < accum.length - 1; i++) {
+        if (accum[i] === 0xff && accum[i + 1] === 0xd9) {
+          eoi = i + 2;
+          break;
+        }
+      }
+
+      if (eoi === -1) {
+        break;
+      }
+
+      const frame = Buffer.from(accum.subarray(0, eoi));
+      accum = accum.subarray(eoi);
+      producedFrames++;
+      broadcastJpegFrame(frame);
+    }
+  });
+
+  ff.on('exit', (code) => {
+    if (activeFfmpeg === ff) {
+      activeFfmpeg = null;
+      activeStreamKey = '';
+      // If 1080p AVFoundation failed before producing any frames, automatically fallback to 720p
+      if (
+        code !== 0 &&
+        producedFrames === 0 &&
+        driver === 'avfoundation' &&
+        !use720pFallback &&
+        streamClients.size > 0
+      ) {
+        ensureFfmpegStream(driver, inputArg, 1280, 720, fps, true);
+      }
+    }
+  });
+}
 
 // 2. Host MJPEG Live Stream Endpoint (for Headless Raspberry Pi, macOS, Windows host streaming)
 app.get('/api/host-stream', async (req, res) => {
@@ -54,77 +292,71 @@ app.get('/api/host-stream', async (req, res) => {
     return;
   }
 
+  req.socket?.setNoDelay(true);
+  res.socket?.setNoDelay(true);
+
   res.writeHead(200, {
     'Content-Type': 'multipart/x-mixed-replace; boundary=ffserver',
     'Cache-Control': 'no-cache, no-store, must-revalidate',
-    Connection: 'close',
+    Connection: 'keep-alive',
     Pragma: 'no-cache',
+    'X-Accel-Buffering': 'no',
   });
+  res.flushHeaders?.();
 
-  let ffmpegArgs: string[] = [];
-  if (selectedCam.driver === 'avfoundation') {
-    ffmpegArgs = [
-      '-f',
-      'avfoundation',
-      '-framerate',
-      String(fps),
-      '-video_size',
-      `${width}x${height}`,
-      '-i',
-      selectedCam.inputArg,
-      '-f',
-      'mpjpeg',
-      '-Boundary_string',
-      'ffserver',
-      '-q:v',
-      '5',
-      'pipe:1',
-    ];
-  } else if (selectedCam.driver === 'v4l2' || selectedCam.driver === 'libcamera') {
-    ffmpegArgs = [
-      '-f',
-      'v4l2',
-      '-framerate',
-      String(fps),
-      '-video_size',
-      `${width}x${height}`,
-      '-i',
-      selectedCam.inputArg,
-      '-f',
-      'mpjpeg',
-      '-Boundary_string',
-      'ffserver',
-      '-q:v',
-      '5',
-      'pipe:1',
-    ];
-  } else {
-    ffmpegArgs = [
-      '-f',
-      'dshow',
-      '-framerate',
-      String(fps),
-      '-video_size',
-      `${width}x${height}`,
-      '-i',
-      selectedCam.inputArg,
-      '-f',
-      'mpjpeg',
-      '-Boundary_string',
-      'ffserver',
-      '-q:v',
-      '5',
-      'pipe:1',
-    ];
+  streamClients.add(res);
+  ensureFfmpegStream(selectedCam.driver, selectedCam.inputArg, width, height, fps);
+
+  // Immediately push the latest cached frame if available so the viewfinder renders with zero cold-start delay
+  if (latestJpegFrame) {
+    const header = Buffer.from(
+      `--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${latestJpegFrame.length}\r\n\r\n`,
+      'ascii'
+    );
+    const footer = Buffer.from('\r\n', 'ascii');
+    res.write(Buffer.concat([header, latestJpegFrame, footer]));
   }
 
-  const ff = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'ignore'] });
-
-  ff.stdout.pipe(res);
-
   req.on('close', () => {
-    ff.kill('SIGTERM');
+    streamClients.delete(res);
+    if (streamClients.size === 0) {
+      if (idleStopTimer) clearTimeout(idleStopTimer);
+      idleStopTimer = setTimeout(() => {
+        if (streamClients.size === 0) {
+          stopActiveFfmpeg();
+        }
+      }, 1500);
+    }
   });
+});
+
+// Single-frame low-latency snapshot endpoint for host stream fallback
+app.get('/api/host-frame', async (req, res) => {
+  const info = await getPlatformInfo();
+  const cameras = await listHostCameras();
+  const deviceId = (req.query.deviceId as string) || cameras[0]?.id;
+  const width = Number(req.query.width) || 1280;
+  const height = Number(req.query.height) || 720;
+  const fps = Number(req.query.fps) || 30;
+
+  const selectedCam = cameras.find((c) => c.id === deviceId) || cameras[0];
+  if (!info.ffmpegAvailable || !selectedCam || selectedCam.driver === 'simulated') {
+    res.status(503).end();
+    return;
+  }
+
+  ensureFfmpegStream(selectedCam.driver, selectedCam.inputArg, width, height, fps);
+
+  if (latestJpegFrame) {
+    res.writeHead(200, {
+      'Content-Type': 'image/jpeg',
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Content-Length': String(latestJpegFrame.length),
+    });
+    res.end(latestJpegFrame);
+  } else {
+    res.status(204).end();
+  }
 });
 
 // 3. Media Gallery API
@@ -205,5 +437,5 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[CamStudio Host Server] Listening on http://0.0.0.0:${PORT}`);
+  console.log(`[PhotonDeck Host Server] Listening on http://0.0.0.0:${PORT}`);
 });

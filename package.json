@@ -1,9 +1,9 @@
 {
-  "name": "camstudio-pro",
+  "name": "photondeck",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "Modern Multi-Platform Camera Studio Web Application (macOS, Raspberry Pi, Windows)",
+  "description": "PhotonDeck — Modern Multi-Platform Camera Studio Web Application (macOS, Raspberry Pi, Linux, Windows)",
   "scripts": {
     "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
     "dev:client": "vite",

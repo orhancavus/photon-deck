@@ -22,7 +22,14 @@ export interface PlatformInfo {
   rpicamAvailable: boolean;
 }
 
-export async function getPlatformInfo(): Promise<PlatformInfo> {
+let cachedPlatformInfo: PlatformInfo | null = null;
+let cachedHostCameras: HostCameraDevice[] | null = null;
+
+export async function getPlatformInfo(forceRefresh = false): Promise<PlatformInfo> {
+  if (cachedPlatformInfo && !forceRefresh) {
+    return cachedPlatformInfo;
+  }
+
   const rawPlatform = os.platform();
   const arch = os.arch();
   const hostname = os.hostname();
@@ -58,7 +65,7 @@ export async function getPlatformInfo(): Promise<PlatformInfo> {
   }
 
   if (rawPlatform === 'darwin') {
-    return {
+    cachedPlatformInfo = {
       platform: 'macos',
       platformLabel: 'macOS (AVFoundation)',
       arch,
@@ -68,7 +75,7 @@ export async function getPlatformInfo(): Promise<PlatformInfo> {
       rpicamAvailable: false,
     };
   } else if (isRaspberryPi) {
-    return {
+    cachedPlatformInfo = {
       platform: 'raspberrypi',
       platformLabel: 'Raspberry Pi OS (V4L2 / libcamera)',
       arch,
@@ -78,7 +85,7 @@ export async function getPlatformInfo(): Promise<PlatformInfo> {
       rpicamAvailable,
     };
   } else if (rawPlatform === 'win32') {
-    return {
+    cachedPlatformInfo = {
       platform: 'windows',
       platformLabel: 'Windows (DirectShow / MediaFoundation)',
       arch,
@@ -88,7 +95,7 @@ export async function getPlatformInfo(): Promise<PlatformInfo> {
       rpicamAvailable: false,
     };
   } else {
-    return {
+    cachedPlatformInfo = {
       platform: 'linux',
       platformLabel: 'Linux (Video4Linux2)',
       arch,
@@ -98,14 +105,20 @@ export async function getPlatformInfo(): Promise<PlatformInfo> {
       rpicamAvailable,
     };
   }
+
+  return cachedPlatformInfo;
 }
 
-export async function listHostCameras(): Promise<HostCameraDevice[]> {
-  const info = await getPlatformInfo();
+export async function listHostCameras(forceRefresh = false): Promise<HostCameraDevice[]> {
+  if (cachedHostCameras && !forceRefresh) {
+    return cachedHostCameras;
+  }
+
+  const info = await getPlatformInfo(forceRefresh);
   const devices: HostCameraDevice[] = [];
 
   if (!info.ffmpegAvailable) {
-    return [
+    cachedHostCameras = [
       {
         id: 'host-default',
         label: `${info.platformLabel} Default Camera`,
@@ -113,6 +126,7 @@ export async function listHostCameras(): Promise<HostCameraDevice[]> {
         inputArg: '0',
       },
     ];
+    return cachedHostCameras;
   }
 
   try {
@@ -184,5 +198,6 @@ export async function listHostCameras(): Promise<HostCameraDevice[]> {
     });
   }
 
+  cachedHostCameras = devices;
   return devices;
 }

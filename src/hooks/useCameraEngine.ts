@@ -35,6 +35,7 @@ export function useCameraEngine(
 ) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hostImgRef = useRef<HTMLImageElement | null>(null);
+  const hostBitmapRef = useRef<ImageBitmap | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -68,8 +69,11 @@ export function useCameraEngine(
   });
 
   // Load initial system info, devices, and gallery
-  const refreshEnvironment = useCallback(async () => {
-    const [sysInfo, media] = await Promise.all([fetchSystemInfo(), fetchAllMedia()]);
+  const refreshEnvironment = useCallback(async (forceRefresh = false) => {
+    const [sysInfo, media] = await Promise.all([
+      fetchSystemInfo(forceRefresh),
+      fetchAllMedia(),
+    ]);
 
     const videoList: CameraDeviceOption[] = [];
     const audioList: Array<{ id: string; label: string }> = [];
@@ -122,7 +126,7 @@ export function useCameraEngine(
   }, []);
 
   useEffect(() => {
-    refreshEnvironment();
+    refreshEnvironment(false);
   }, [refreshEnvironment]);
 
   // Compute target output dimensions based on resolution preset + aspect ratio
@@ -157,6 +161,8 @@ export function useCameraEngine(
     let cancelled = false;
     let audioCtx: AudioContext | null = null;
     let audioMeterInterval: number | null = null;
+    const hostAbortController = new AbortController();
+    let hostPollTimer: number | null = null;
 
     async function startStream() {
       // Stop existing tracks
@@ -179,6 +185,7 @@ export function useCameraEngine(
 
       if (settings.engineMode === 'host') {
         const dims = getTargetDimensions();
+        const preset = RESOLUTION_PRESETS[settings.resolution];
         setState((prev) => ({
           ...prev,
           isStreaming: true,
@@ -186,6 +193,148 @@ export function useCameraEngine(
           actualHeight: dims.height,
           errorMsg: null,
         }));
+
+        // Optionally attach microphone for audio meter & video recording while in Host OS camera mode
+        if (settings.audioEnabled && navigator.mediaDevices?.getUserMedia) {
+          const audioConstraints: boolean | MediaTrackConstraints =
+            settings.selectedAudioDeviceId && settings.selectedAudioDeviceId !== 'default'
+              ? { deviceId: { exact: settings.selectedAudioDeviceId } }
+              : true;
+          navigator.mediaDevices
+            .getUserMedia({ video: false, audio: audioConstraints })
+            .then((audioStream) => {
+              if (cancelled) {
+                audioStream.getTracks().forEach((t) => t.stop());
+                return;
+              }
+              mediaStreamRef.current = audioStream;
+              const AudioContextClass =
+                window.AudioContext ||
+                (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+              if (AudioContextClass && audioStream.getAudioTracks().length > 0) {
+                audioCtx = new AudioContextClass();
+                const src = audioCtx.createMediaStreamSource(audioStream);
+                const analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 256;
+                src.connect(analyser);
+                const buf = new Uint8Array(analyser.frequencyBinCount);
+                audioMeterInterval = window.setInterval(() => {
+                  analyser.getByteFrequencyData(buf);
+                  const avg = buf.reduce((a, b) => a + b, 0) / buf.length;
+                  setState((prev) => ({
+                    ...prev,
+                    audioLevel: Math.min(100, Math.round((avg / 140) * 100)),
+                  }));
+                }, 100);
+              }
+            })
+            .catch(() => {
+              // ignore audio error in host mode
+            });
+        }
+
+        const queryParams = `deviceId=${encodeURIComponent(
+          settings.selectedVideoDeviceId
+        )}&width=${preset.width}&height=${preset.height}&fps=${settings.fps}`;
+        const streamUrl = `/api/host-stream?${queryParams}`;
+        const frameUrl = `/api/host-frame?${queryParams}`;
+
+        let isDecoding = false;
+        let pendingBytes: Uint8Array | null = null;
+        let lastStreamFrameAt = performance.now();
+
+        const decodeNextJpeg = async (jpegBytes: Uint8Array) => {
+          if (cancelled) return;
+          if (isDecoding) {
+            pendingBytes = jpegBytes;
+            return;
+          }
+          isDecoding = true;
+          try {
+            let current: Uint8Array | null = jpegBytes;
+            while (current && !cancelled) {
+              const copy = new Uint8Array(current.byteLength);
+              copy.set(current);
+              const blob = new Blob([copy], { type: 'image/jpeg' });
+              const bmp = await createImageBitmap(blob);
+              if (cancelled) {
+                bmp.close();
+                break;
+              }
+              const old = hostBitmapRef.current;
+              hostBitmapRef.current = bmp;
+              if (old) {
+                old.close();
+              }
+              current = pendingBytes;
+              pendingBytes = null;
+            }
+          } catch {
+            // ignore corrupted partial JPEG
+          } finally {
+            isDecoding = false;
+          }
+        };
+
+        // Fallback frame poller in case any intermediate proxy buffers multipart streams
+        hostPollTimer = window.setInterval(async () => {
+          if (cancelled) return;
+          if (performance.now() - lastStreamFrameAt < 450) return;
+          try {
+            const res = await fetch(`${frameUrl}&_t=${Date.now()}`, {
+              signal: hostAbortController.signal,
+              cache: 'no-store',
+            });
+            if (res.status === 200) {
+              const ab = await res.arrayBuffer();
+              if (ab.byteLength > 0) {
+                decodeNextJpeg(new Uint8Array(ab));
+              }
+            }
+          } catch {
+            // ignore abort or transient error
+          }
+        }, 120);
+
+        // Primary continuous low-latency MJPEG stream reader
+        (async () => {
+          while (!cancelled) {
+            try {
+              const res = await fetch(streamUrl, {
+                signal: hostAbortController.signal,
+                cache: 'no-store',
+              });
+              if (!res.ok || !res.body) {
+                await new Promise((r) => setTimeout(r, 500));
+                continue;
+              }
+
+              const reader = res.body.getReader();
+              let accum = new Uint8Array(0);
+
+              while (!cancelled) {
+                const { done, value } = await reader.read();
+                if (done || !value) break;
+
+                const combined = new Uint8Array(accum.length + value.length);
+                combined.set(accum, 0);
+                combined.set(value, accum.length);
+
+                const extracted = extractLatestJpegFromBuffer(combined);
+                accum = extracted.remaining;
+
+                if (extracted.frame) {
+                  lastStreamFrameAt = performance.now();
+                  decodeNextJpeg(extracted.frame);
+                }
+              }
+            } catch {
+              if (cancelled) break;
+              await new Promise((r) => setTimeout(r, 400));
+            }
+          }
+        })();
+
         return;
       }
 
@@ -227,16 +376,32 @@ export function useCameraEngine(
       try {
         let stream: MediaStream;
         try {
+          // Request video first so microphone permission denial or missing mic doesn't break camera capture
           stream = await navigator.mediaDevices.getUserMedia({
             video: videoConstraints,
-            audio: audioConstraints,
+            audio: false,
           });
         } catch {
-          // Fallback to relaxed constraints if exact device or audio fails
+          // Fallback to relaxed video constraints if exact resolution/device fails
           stream = await navigator.mediaDevices.getUserMedia({
             video: true,
             audio: false,
           });
+        }
+
+        // Optionally attach audio track if enabled
+        if (audioConstraints) {
+          try {
+            const audioStream = await navigator.mediaDevices.getUserMedia({
+              video: false,
+              audio: audioConstraints,
+            });
+            for (const aTrack of audioStream.getAudioTracks()) {
+              stream.addTrack(aTrack);
+            }
+          } catch {
+            // Continue with video even if audio permission is denied
+          }
         }
 
         if (cancelled) {
@@ -246,12 +411,16 @@ export function useCameraEngine(
 
         mediaStreamRef.current = stream;
         if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play().catch(() => {});
+          const vEl = videoRef.current;
+          vEl.srcObject = stream;
+          vEl.onloadedmetadata = () => {
+            vEl.play().catch(() => {});
+          };
+          await vEl.play().catch(() => {});
         }
 
         // Refresh device labels once permission is granted
-        refreshEnvironment();
+        refreshEnvironment(false);
 
         // Setup live audio VU meter if audio track exists
         const audioTracks = stream.getAudioTracks();
@@ -289,6 +458,24 @@ export function useCameraEngine(
       } catch (err) {
         if (cancelled) return;
         const dims = getTargetDimensions();
+        // Check if host OS camera (e.g. macOS AVFoundation via FFmpeg) is available before falling back to test-pattern
+        const sysInfo = await fetchSystemInfo();
+        const firstHostCam = sysInfo.hostCameras?.find((c) => c.driver !== 'simulated');
+        if (sysInfo.ffmpegAvailable && firstHostCam) {
+          setState((prev) => ({
+            ...prev,
+            isStreaming: true,
+            actualWidth: dims.width,
+            actualHeight: dims.height,
+            errorMsg: null,
+          }));
+          updateSettings({
+            engineMode: 'host',
+            selectedVideoDeviceId: firstHostCam.id,
+          });
+          return;
+        }
+
         setState((prev) => ({
           ...prev,
           isStreaming: true,
@@ -304,6 +491,8 @@ export function useCameraEngine(
 
     return () => {
       cancelled = true;
+      hostAbortController.abort();
+      if (hostPollTimer) clearInterval(hostPollTimer);
       if (audioMeterInterval) clearInterval(audioMeterInterval);
       if (audioCtx) audioCtx.close().catch(() => {});
       if (mediaStreamRef.current) {
@@ -366,6 +555,7 @@ export function useCameraEngine(
               : canvas.height;
 
           const videoEl = videoRef.current;
+          const hostBmp = hostBitmapRef.current;
           const hostImgEl = hostImgRef.current;
 
           if (
@@ -393,13 +583,52 @@ export function useCameraEngine(
             }
 
             ctx.drawImage(videoEl, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
+          } else if (settings.engineMode === 'host' && hostBmp && hostBmp.width > 0) {
+            const iw = hostBmp.width;
+            const ih = hostBmp.height;
+            const srcRatio = iw / ih;
+            const dstRatio = drawW / drawH;
+
+            let sx = 0;
+            let sy = 0;
+            let sw = iw;
+            let sh = ih;
+
+            if (srcRatio > dstRatio) {
+              sw = ih * dstRatio;
+              sx = (iw - sw) / 2;
+            } else {
+              sh = iw / dstRatio;
+              sy = (ih - sh) / 2;
+            }
+
+            ctx.drawImage(hostBmp, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
           } else if (
             settings.engineMode === 'host' &&
             hostImgEl &&
-            hostImgEl.complete &&
             hostImgEl.naturalWidth > 0
           ) {
-            ctx.drawImage(hostImgEl, -drawW / 2, -drawH / 2, drawW, drawH);
+            const iw = hostImgEl.naturalWidth;
+            const ih = hostImgEl.naturalHeight;
+            const srcRatio = iw / ih;
+            const dstRatio = drawW / drawH;
+
+            let sx = 0;
+            let sy = 0;
+            let sw = iw;
+            let sh = ih;
+
+            if (srcRatio > dstRatio) {
+              sw = ih * dstRatio;
+              sx = (iw - sw) / 2;
+            } else {
+              sh = iw / dstRatio;
+              sy = (ih - sh) / 2;
+            }
+
+            ctx.drawImage(hostImgEl, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
+          } else if (settings.engineMode === 'host') {
+            drawHostWarmupScene(ctx, drawW, drawH);
           } else {
             // Render rich interactive Cinema Calibration & Sensor Simulation Pattern
             drawStudioCalibrationScene(ctx, drawW, drawH, now, settings);
@@ -842,7 +1071,7 @@ function drawStudioCalibrationScene(
   ctx.font = `600 ${Math.max(14, Math.round(h * 0.026))}px ui-monospace, SFMono-Regular, Menlo, monospace`;
   ctx.textAlign = 'center';
   ctx.fillText(
-    `CAMSTUDIO OPTICAL TEST SIGNAL • ${w}×${h} @ ${settings.fps}FPS`,
+    `PHOTONDECK OPTICAL TEST SIGNAL • ${w}×${h} @ ${settings.fps}FPS`,
     0,
     -h * 0.34
   );
@@ -856,3 +1085,53 @@ function drawStudioCalibrationScene(
   );
   ctx.restore();
 }
+
+function drawHostWarmupScene(ctx: CanvasRenderingContext2D, w: number, h: number) {
+  ctx.save();
+  ctx.fillStyle = '#09090b';
+  ctx.fillRect(-w / 2, -h / 2, w, h);
+  ctx.fillStyle = 'rgba(245, 158, 11, 0.9)';
+  ctx.font = `600 ${Math.max(14, Math.round(h * 0.024))}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillText('CONNECTING TO HOST HARDWARE CAMERA...', 0, 0);
+  ctx.restore();
+}
+
+// Extracts the most recent complete JPEG frame (0xFFD8 .. 0xFFD9) from a rolling byte buffer
+function extractLatestJpegFromBuffer(buf: Uint8Array): {
+  frame: Uint8Array | null;
+  remaining: Uint8Array;
+} {
+  let latestFrame: Uint8Array | null = null;
+  let cursor = 0;
+
+  while (cursor < buf.length - 1) {
+    let soi = -1;
+    for (let i = cursor; i < buf.length - 1; i++) {
+      if (buf[i] === 0xff && buf[i + 1] === 0xd8) {
+        soi = i;
+        break;
+      }
+    }
+    if (soi === -1) {
+      return { frame: latestFrame, remaining: new Uint8Array(0) };
+    }
+
+    let eoi = -1;
+    for (let i = soi + 2; i < buf.length - 1; i++) {
+      if (buf[i] === 0xff && buf[i + 1] === 0xd9) {
+        eoi = i + 2;
+        break;
+      }
+    }
+    if (eoi === -1) {
+      return { frame: latestFrame, remaining: buf.slice(soi) };
+    }
+
+    latestFrame = buf.slice(soi, eoi);
+    cursor = eoi;
+  }
+
+  return { frame: latestFrame, remaining: new Uint8Array(0) };
+}
+
