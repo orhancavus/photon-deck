@@ -24,11 +24,11 @@ app.use('/media-files', express.static(getMediaDir()));
 import { ChildProcess } from 'child_process';
 
 // 1. System & Platform Info
-app.get('/api/system-info', async (req, res) => {
+app.get('/api/system-info', async (_req, res) => {
   try {
-    const forceRefresh = req.query.refresh === '1';
-    const info = await getPlatformInfo(forceRefresh);
-    const hostCameras = await listHostCameras(forceRefresh);
+    const info = await getPlatformInfo(false);
+    // Always perform a fresh camera scan when /api/system-info is queried so newly awakened iPhone Continuity Cameras appear
+    const hostCameras = await listHostCameras(true);
     res.json({
       ...info,
       hostCameras,
@@ -69,6 +69,7 @@ function stopActiveFfmpeg() {
     activeFfmpeg = null;
   }
   activeStreamKey = '';
+  latestJpegFrame = null;
 }
 
 function sendFrameToClient(client: StreamClient, jpegBuf: Buffer) {
@@ -325,6 +326,28 @@ function ensureFfmpegStream(
   });
 }
 
+function resolveRequestedCamera(
+  deviceId: string | undefined,
+  cameras: Awaited<ReturnType<typeof listHostCameras>>
+) {
+  if (deviceId) {
+    const exact = cameras.find((c) => c.id === deviceId);
+    if (exact) return exact;
+    if (deviceId.startsWith('avfoundation-web-')) {
+      const camName = deviceId.slice('avfoundation-web-'.length).trim();
+      if (camName) {
+        return {
+          id: deviceId,
+          label: `${camName} (Host AVFoundation)`,
+          driver: 'avfoundation' as const,
+          inputArg: `${camName}:none`,
+        };
+      }
+    }
+  }
+  return cameras[0];
+}
+
 // 2. Host MJPEG Live Stream Endpoint (supports ?raw=1 length-prefixed binary frames + multipart MJPEG)
 app.get('/api/host-stream', async (req, res) => {
   const info = await getPlatformInfo();
@@ -335,7 +358,7 @@ app.get('/api/host-stream', async (req, res) => {
   const fps = Number(req.query.fps) || 30;
   const raw = req.query.raw === '1';
 
-  const selectedCam = cameras.find((c) => c.id === deviceId) || cameras[0];
+  const selectedCam = resolveRequestedCamera(deviceId, cameras);
 
   if (!info.ffmpegAvailable || !selectedCam || selectedCam.driver === 'simulated') {
     res.status(503).json({
@@ -388,7 +411,7 @@ app.get('/api/host-frame', async (req, res) => {
   const height = Number(req.query.height) || 720;
   const fps = Number(req.query.fps) || 30;
 
-  const selectedCam = cameras.find((c) => c.id === deviceId) || cameras[0];
+  const selectedCam = resolveRequestedCamera(deviceId, cameras);
   if (!info.ffmpegAvailable || !selectedCam || selectedCam.driver === 'simulated') {
     res.status(503).end();
     return;

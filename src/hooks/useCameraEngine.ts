@@ -69,7 +69,7 @@ export function useCameraEngine(
   });
 
   // Load initial system info, devices, and gallery
-  const refreshEnvironment = useCallback(async (forceRefresh = false) => {
+  const refreshEnvironment = useCallback(async (forceRefresh = true) => {
     const [sysInfo, media] = await Promise.all([
       fetchSystemInfo(forceRefresh),
       fetchAllMedia(),
@@ -77,17 +77,47 @@ export function useCameraEngine(
 
     const videoList: CameraDeviceOption[] = [];
     const audioList: Array<{ id: string; label: string }> = [];
+    const discoveredWebrtcNames: string[] = [];
 
     if (navigator.mediaDevices?.enumerateDevices) {
       try {
-        const devs = await navigator.mediaDevices.enumerateDevices();
+        let devs = await navigator.mediaDevices.enumerateDevices();
+        const hasVideoLabels = devs.some((d) => d.kind === 'videoinput' && d.label.trim().length > 0);
+
+        // Unlock full hardware labels (required by macOS Safari/Chrome to expose iPhone Continuity Camera)
+        if (!hasVideoLabels && navigator.mediaDevices?.getUserMedia) {
+          try {
+            const probeStream = await navigator.mediaDevices.getUserMedia({
+              video: true,
+              audio: false,
+            });
+            probeStream.getTracks().forEach((t) => t.stop());
+            devs = await navigator.mediaDevices.enumerateDevices();
+          } catch {
+            // ignore permission probe failure
+          }
+        }
+
         let vIdx = 1;
         let aIdx = 1;
         for (const d of devs) {
           if (d.kind === 'videoinput') {
+            const rawLabel = d.label.trim();
+            const cleanBaseName = rawLabel
+              .replace(/\s*\([0-9a-fA-F]{4}:[0-9a-fA-F]{4}\)\s*$/, '')
+              .trim();
+            if (cleanBaseName) {
+              discoveredWebrtcNames.push(cleanBaseName);
+            }
+            const displayLabel = rawLabel
+              ? rawLabel.toLowerCase().includes('webrtc')
+                ? rawLabel
+                : `${rawLabel} (WebRTC)`
+              : `Local Camera #${vIdx++} (WebRTC)`;
+
             videoList.push({
               id: d.deviceId || `webrtc-cam-${vIdx}`,
-              label: d.label || `Local Camera #${vIdx++} (WebRTC)`,
+              label: displayLabel,
               source: 'webrtc',
             });
           } else if (d.kind === 'audioinput') {
@@ -110,6 +140,24 @@ export function useCameraEngine(
       });
     }
 
+    // On macOS, if WebRTC discovered a Continuity Camera / iPhone Camera that FFmpeg's legacy
+    // [AVCaptureDevice devicesWithMediaType:] omitted, also expose it in the Host AVFoundation list
+    if (sysInfo.platform === 'macos') {
+      for (const camName of discoveredWebrtcNames) {
+        const norm = camName.toLowerCase();
+        const alreadyInHost = (sysInfo.hostCameras || []).some((hc) =>
+          hc.label.toLowerCase().includes(norm)
+        );
+        if (!alreadyInHost) {
+          videoList.push({
+            id: `avfoundation-web-${camName}`,
+            label: `${camName} (Host AVFoundation)`,
+            source: 'host',
+          });
+        }
+      }
+    }
+
     videoList.push({
       id: 'virtual-studio-pattern',
       label: 'Studio Calibration Signal (60fps 4K Generator)',
@@ -126,7 +174,22 @@ export function useCameraEngine(
   }, []);
 
   useEffect(() => {
-    refreshEnvironment(false);
+    refreshEnvironment(true);
+
+    // macOS Continuity Camera (iPhone) wakes up wirelessly 1-3s after initial AVFoundation access
+    const t1 = window.setTimeout(() => refreshEnvironment(true), 1500);
+    const t2 = window.setTimeout(() => refreshEnvironment(true), 3500);
+
+    const handleDeviceChange = () => {
+      refreshEnvironment(true);
+    };
+    navigator.mediaDevices?.addEventListener?.('devicechange', handleDeviceChange);
+
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      navigator.mediaDevices?.removeEventListener?.('devicechange', handleDeviceChange);
+    };
   }, [refreshEnvironment]);
 
   // Compute target output dimensions based on resolution preset + aspect ratio
@@ -171,6 +234,12 @@ export function useCameraEngine(
         mediaStreamRef.current = null;
       }
 
+      // Clear previous host bitmap when switching cameras so stale frame isn't shown
+      if (hostBitmapRef.current) {
+        hostBitmapRef.current.close();
+        hostBitmapRef.current = null;
+      }
+
       if (settings.engineMode === 'test-pattern' || settings.selectedVideoDeviceId === 'virtual-studio-pattern') {
         const dims = getTargetDimensions();
         setState((prev) => ({
@@ -193,6 +262,54 @@ export function useCameraEngine(
           actualHeight: dims.height,
           errorMsg: null,
         }));
+
+        // If user selected a macOS Continuity Camera (iPhone) exposed under Host AVFoundation
+        // (avfoundation-name-* or avfoundation-web-*), also open its native WebRTC Continuity stream
+        // if FFmpeg's deprecated [AVCaptureDevice devicesWithMediaType:] API cannot access it directly.
+        if (
+          (settings.selectedVideoDeviceId.startsWith('avfoundation-name-') ||
+            settings.selectedVideoDeviceId.startsWith('avfoundation-web-')) &&
+          navigator.mediaDevices?.enumerateDevices
+        ) {
+          (async () => {
+            try {
+              const targetHint = settings.selectedVideoDeviceId
+                .replace(/^avfoundation-(name|web)-/, '')
+                .replace(/-/g, ' ')
+                .toLowerCase();
+              const devs = await navigator.mediaDevices.enumerateDevices();
+              const matchedWebrtc = devs.find(
+                (d) =>
+                  d.kind === 'videoinput' &&
+                  d.label &&
+                  (d.label.toLowerCase().includes(targetHint) ||
+                    (targetHint.includes('iphone') && d.label.toLowerCase().includes('iphone')))
+              );
+              if (matchedWebrtc && !cancelled) {
+                const vStream = await navigator.mediaDevices.getUserMedia({
+                  video: {
+                    deviceId: { exact: matchedWebrtc.deviceId },
+                    width: { ideal: preset.width },
+                    height: { ideal: preset.height },
+                    frameRate: { ideal: settings.fps },
+                  },
+                  audio: false,
+                });
+                if (cancelled) {
+                  vStream.getTracks().forEach((t) => t.stop());
+                  return;
+                }
+                mediaStreamRef.current = vStream;
+                if (videoRef.current) {
+                  videoRef.current.srcObject = vStream;
+                  await videoRef.current.play().catch(() => {});
+                }
+              }
+            } catch {
+              // ignore if Continuity bridge not needed
+            }
+          })();
+        }
 
         // Optionally attach microphone for audio meter & video recording while in Host OS camera mode
         if (settings.audioEnabled && navigator.mediaDevices?.getUserMedia) {
@@ -586,7 +703,8 @@ export function useCameraEngine(
           const hostImgEl = hostImgRef.current;
 
           if (
-            settings.engineMode === 'webrtc' &&
+            (settings.engineMode === 'webrtc' ||
+              (settings.engineMode === 'host' && !hostBmp)) &&
             videoEl &&
             videoEl.readyState >= 2 &&
             videoEl.videoWidth > 0
