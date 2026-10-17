@@ -8,8 +8,9 @@ A modern, multi-platform Camera Studio Web Application built for **macOS**, **Ra
 
 ### 🎥 Multi-Engine Video Pipeline
 - **WebRTC Engine**: Direct low-latency browser camera & microphone capture via `navigator.mediaDevices.getUserMedia`.
-- **Host Stream Engine**: Hardware-level MJPEG live streaming powered by FFmpeg (`avfoundation` on macOS, `v4l2`/`libcamera` on Linux & Raspberry Pi, `dshow` on Windows) — ideal for headless Raspberry Pi camera rigs.
-- **Test Pattern Generator**: Built-in animated synthetic SMPTE/studio broadcast pattern for testing without physical camera hardware.
+- **Host Stream Engine**: Hardware-level low-latency binary (`UInt32BE` length-prefixed JPEG + `createImageBitmap`) and MJPEG live streaming powered by FFmpeg (`avfoundation` on macOS, `v4l2`/`libcamera` on Linux & Raspberry Pi, `dshow` on Windows) — ideal for headless Raspberry Pi camera rigs.
+- **macOS Continuity Camera (iPhone)**: Automatic CoreMediaIO (`SPCameraDataType`) wireless/USB iPhone camera discovery and seamless WebRTC hardware bridging.
+- **Test Pattern Generator**: Built-in animated synthetic 60 FPS SMPTE/studio broadcast pattern for testing without physical camera hardware.
 
 ### 📸 Capture Modes
 - **Single Photo**: High-resolution still capture (`JPEG`, `PNG`, `WebP`) with configurable quality and self-timer delays (`Off`, `3s`, `5s`, `10s`).
@@ -57,6 +58,8 @@ A modern, multi-platform Camera Studio Web Application built for **macOS**, **Ra
 
 ```text
 photon-deck/
+├── ARCHITECTURE.md              # High-level & detailed technical architecture
+├── LICENSE                      # MIT License
 ├── index.html                   # Main HTML entry point
 ├── package.json                 # Dependencies and scripts
 ├── tsconfig.json                # TypeScript configuration
@@ -64,8 +67,8 @@ photon-deck/
 ├── media/                       # Host-side captured media storage
 │   └── index.json               # Media metadata index
 ├── server/                      # Express backend server
-│   ├── index.ts                 # API endpoints & static server
-│   ├── cameraManager.ts         # OS detection & hardware camera discovery
+│   ├── index.ts                 # API endpoints & binary/MJPEG stream server
+│   ├── cameraManager.ts         # OS detection & hardware/Continuity camera discovery
 │   └── mediaStore.ts            # Disk persistence for photos & videos
 └── src/                         # Frontend React application
     ├── main.tsx                 # React DOM entry
@@ -88,6 +91,12 @@ photon-deck/
     └── types/                   # TypeScript interfaces
         └── camera.ts            # Shared camera, media & system types
 ```
+
+---
+
+## 🏗️ Technical Architecture
+
+For deep-dive diagrams and implementation specifications — including the **Tri-Engine Video Pipeline**, **Length-Prefixed `UInt32BE` Binary Streaming Protocol**, **macOS Continuity Camera Hybrid Bridging**, and **60 FPS Canvas Compositor Math** — see [**ARCHITECTURE.md**](ARCHITECTURE.md).
 
 ---
 
@@ -138,9 +147,17 @@ The production server will listen on `http://0.0.0.0:3001` (or the port specifie
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
-| `GET` | `/api/system-info` | Returns host OS platform, architecture, FFmpeg/rpicam status, and detected host cameras. |
-| `GET` | `/api/host-stream` | Streams live `multipart/x-mixed-replace` MJPEG video from a host camera via FFmpeg. |
+| `GET` | `/api/system-info` | Returns host OS platform, architecture, FFmpeg/rpicam status, and detected host & Continuity cameras. |
+| `GET` | `/api/host-stream` | Streams live length-prefixed binary (`?raw=1`) or `multipart/x-mixed-replace` MJPEG video via FFmpeg. |
+| `GET` | `/api/host-frame` | Returns the latest single JPEG frame (`X-Frame-Seq`) for low-overhead snapshot polling. |
 | `GET` | `/api/media` | Lists all captured media items stored in `./media`. |
 | `POST` | `/api/media` | Uploads and persists a new photo or video capture to `./media`. |
 | `DELETE` | `/api/media/:id` | Deletes a specific media item by ID. |
 | `POST` | `/api/media/batch-delete` | Deletes multiple media items in a single request. |
+
+---
+
+## 📄 License
+
+Released under the [MIT License](LICENSE). Created by [Orhan Cavus](https://github.com/orhancavus).
+

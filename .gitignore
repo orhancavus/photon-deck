@@ -106,3 +106,8 @@ dmypy.json
 alerts/
 analysis.jsonl
 notebook/
+AGENTS.md
+GEMINI.md
+.agents/
+.agent/
+

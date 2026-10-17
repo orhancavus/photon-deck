@@ -325,8 +325,8 @@ erDiagram
    - Every captured photo or recorded video is written to IndexedDB **first** (`saveLocalMedia`), guaranteeing zero data loss even if the Node.js backend is offline or unreachable.
 2. **Tier 2 — Node.js Filesystem Store ([`server/mediaStore.ts`](server/mediaStore.ts))**:
    - `saveMediaToServer()` sends the Base64 data URL and metadata to `POST /api/media`.
-   - The server strips the `data:<mime>;base64,` prefix, converts the payload into a Node `Buffer`, writes the raw binary file to `./media/<filename>`, and prepends the metadata record to `./media/index.json`.
-   - Static files are served directly via `app.use('/media', express.static('./media'))`.
+   - The server strips the `data:<mime>;base64,` prefix, converts the payload into a Node `Buffer`, sanitizes the filename via `path.basename()`, writes the raw binary file to `./media/<filename>`, and prepends the metadata record to `./media/index.json`.
+   - Static files are served directly via `app.use('/media-files', express.static('./media'))`.
 3. **Gallery Reconciliation & Tombstone Tracking**:
    - On startup, `useCameraEngine` merges items from both `GET /api/media` and `getAllLocalMedia()`, deduplicating by `id`.
    - Deleted item IDs are tracked in `deletedIdsRef` so asynchronous in-flight saves cannot resurrect an item that the user deleted moments after capture.
@@ -339,14 +339,13 @@ Implemented in [`server/index.ts`](server/index.ts):
 
 | Method | Endpoint | Query / Body Parameters | Response Format | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `GET` | `/api/status` | None | `application/json` (`SystemStatus`) | Returns host platform (`macos`, `raspberry-pi`, `linux`, `windows`), architecture, hostname, uptime, FFmpeg/V4L2/libcamera availability, and discovered host cameras. |
-| `GET` | `/api/cameras` | None | `application/json` (`CameraDeviceInfo[]`) | Re-scans and returns current host OS cameras (including macOS Continuity Cameras). |
-| `GET` | `/api/host-stream` | `device`, `width`, `height`, `fps`, `raw` (`1` or `0`) | `application/octet-stream` (`raw=1`) or `multipart/x-mixed-replace` | Attaches to the singleton FFmpeg capture process for the specified device and streams live MJPEG frames. |
-| `GET` | `/api/host-frame` | `device`, `width`, `height`, `fps` | `image/jpeg` + Header `X-Frame-Seq` | Returns the latest cached JPEG frame from the active FFmpeg stream for polling fallback clients. |
-| `GET` | `/api/media` | None | `application/json` (`MediaItem[]`) | Lists all persisted media items from `./media/index.json`. |
-| `POST` | `/api/media` | `{ dataUrl, type, format, width, height, durationSec, metadata }` | `application/json` (`MediaItem`, HTTP `201`) | Decodes Base64 media payload, writes binary file to `./media/`, and updates `./media/index.json`. |
-| `DELETE` | `/api/media/:id` | `:id` (URL Param) | `application/json` (`{ success: true }`) | Deletes the binary media file from disk and removes its entry from `./media/index.json`. |
-| `DELETE` | `/api/media` | None | `application/json` (`{ cleared: number }`) | Bulk-deletes all stored media files and resets `./media/index.json`. |
+| `GET` | `/api/system-info` | None | `application/json` (`SystemInfoResponse`) | Returns host platform (`macos`, `raspberry-pi`, `linux`, `windows`), architecture, hostname, FFmpeg/V4L2/rpicam availability, and discovered host & Continuity cameras. |
+| `GET` | `/api/host-stream` | `deviceId`, `width`, `height`, `fps`, `raw` (`1` or `0`) | `application/octet-stream` (`raw=1`) or `multipart/x-mixed-replace` | Attaches to the singleton FFmpeg capture process for the specified device and streams live length-prefixed binary or multipart MJPEG frames. |
+| `GET` | `/api/host-frame` | `deviceId`, `width`, `height`, `fps` | `image/jpeg` + Header `X-Frame-Seq` | Returns the latest cached JPEG frame from the active FFmpeg stream for polling fallback clients. |
+| `GET` | `/api/media` | None | `application/json` (`{ items: StoredMediaMetadata[] }`) | Lists all persisted media items from `./media/index.json`. |
+| `POST` | `/api/media` | `{ id, filename, dataUrl, type, format, mimeType, width, height, ... }` | `application/json` (`{ item: StoredMediaMetadata }`, HTTP `201`) | Decodes Base64 media payload, writes sanitized binary file to `./media/`, and updates `./media/index.json`. |
+| `DELETE` | `/api/media/:id` | `:id` (URL Param) | `application/json` (`{ deleted: boolean }`) | Deletes the binary media file from disk and removes its entry from `./media/index.json`. |
+| `POST` | `/api/media/batch-delete` | `{ ids: string[] }` | `application/json` (`{ deletedCount: number }`) | Bulk-deletes multiple media items by ID from `./media/` and `./media/index.json`. |
 
 ---
 

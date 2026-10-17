@@ -2,6 +2,16 @@
   "name": "photondeck",
   "private": true,
   "version": "1.0.0",
+  "license": "MIT",
+  "author": {
+    "name": "Orhan Cavus",
+    "url": "https://github.com/orhancavus"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/orhancavus/photon-deck.git"
+  },
+  "homepage": "https://github.com/orhancavus/photon-deck#readme",
   "type": "module",
   "description": "PhotonDeck — Modern Multi-Platform Camera Studio Web Application (macOS, Raspberry Pi, Linux, Windows)",
   "scripts": {

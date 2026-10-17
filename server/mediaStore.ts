@@ -45,7 +45,7 @@ export function listMediaItems(): StoredMediaMetadata[] {
     const items = JSON.parse(raw) as StoredMediaMetadata[];
     // Filter out any item whose file was removed manually
     return items
-      .filter((item) => fs.existsSync(path.join(MEDIA_DIR, item.filename)))
+      .filter((item) => fs.existsSync(path.join(MEDIA_DIR, path.basename(item.filename))))
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   } catch {
     return [];
@@ -57,13 +57,15 @@ export function saveMediaItem(
   meta: Omit<StoredMediaMetadata, 'sizeBytes' | 'url'>
 ): StoredMediaMetadata {
   ensureMediaDir();
-  const filePath = path.join(MEDIA_DIR, meta.filename);
+  const safeFilename = path.basename(meta.filename);
+  const filePath = path.join(MEDIA_DIR, safeFilename);
   fs.writeFileSync(filePath, buffer);
 
   const fullItem: StoredMediaMetadata = {
     ...meta,
+    filename: safeFilename,
     sizeBytes: buffer.length,
-    url: `/media-files/${meta.filename}`,
+    url: `/media-files/${safeFilename}`,
   };
 
   const existing = listMediaItems().filter((i) => i.id !== fullItem.id);
@@ -79,7 +81,7 @@ export function deleteMediaItem(id: string): boolean {
   const target = items.find((i) => i.id === id);
   if (!target) return false;
 
-  const filePath = path.join(MEDIA_DIR, target.filename);
+  const filePath = path.join(MEDIA_DIR, path.basename(target.filename));
   if (fs.existsSync(filePath)) {
     fs.unlinkSync(filePath);
   }
