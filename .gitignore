@@ -1,0 +1,108 @@
+# ==============================================================================
+# CamStudio Pro - .gitignore
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Dependencies & Package Managers
+# ------------------------------------------------------------------------------
+node_modules/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ------------------------------------------------------------------------------
+# Production Build & Bundler Outputs
+# ------------------------------------------------------------------------------
+dist/
+dist-ssr/
+build/
+.vite/
+*.local
+
+# ------------------------------------------------------------------------------
+# TypeScript
+# ------------------------------------------------------------------------------
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# ------------------------------------------------------------------------------
+# CamStudio Pro Runtime Media & Local Captures
+# ------------------------------------------------------------------------------
+media/*
+!media/.gitkeep
+
+# ------------------------------------------------------------------------------
+# Environment Variables & Secrets
+# ------------------------------------------------------------------------------
+.env
+.env.local
+.env.*.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ------------------------------------------------------------------------------
+# OS & Editor Artifacts
+# ------------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+*.swp
+*.swo
+*~
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# ------------------------------------------------------------------------------
+# Testing & Coverage
+# ------------------------------------------------------------------------------
+coverage/
+htmlcov/
+.nyc_output/
+.coverage
+.coverage.*
+*.cover
+nosetests.xml
+coverage.xml
+
+# ------------------------------------------------------------------------------
+# Python & Virtual Environments (Workspace Defaults)
+# ------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+*.egg
+.tox/
+.nox/
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# ------------------------------------------------------------------------------
+# Workspace Custom & Scratch Files
+# ------------------------------------------------------------------------------
+alerts/
+analysis.jsonl
+notebook/
