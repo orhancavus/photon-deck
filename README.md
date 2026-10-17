@@ -2,6 +2,8 @@
 
 A modern, multi-platform Camera Studio Web Application built for **macOS**, **Raspberry Pi**, **Linux**, and **Windows**. It features a hardware-inspired dark-room UI, multi-engine live video streaming, professional viewfinder tools, real-time RGB histogram analysis, and dual-storage media management.
 
+![PhotonDeck Camera Studio](photondeck.png)
+
 ---
 
 ## ✨ Features
